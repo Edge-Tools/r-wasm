@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+#
+# emflang — a Fortran compiler for the wasm R build.
+#
+# emscripten ships clang but no Fortran front end, and R's numerical core plus
+# its bundled BLAS/LAPACK are Fortran — modern Fortran (F90), since R 4.2. This
+# wrapper presents, to R's configure and Makefiles, a single Fortran compiler
+# backed by LLVM **flang**:
+#
+#   .f / .f90 source --[ flang ]--> wasm object
+#
+# flang here is the r-wasm/flang-wasm build of LLVM flang — patched to target
+# WebAssembly and configured with the wasm32-unknown-emscripten default triple
+# (see the Dockerfile). Unlike f2c it is a real Fortran compiler: it handles
+# modern Fortran and emits objects with the ABI R's C code expects.
+#
+# It handles the two shapes autoconf/automake invoke a Fortran compiler in:
+#   compile:  emflang [flags] -c foo.f90 -o foo.o   -> straight to flang
+#   link:     emflang [flags] a.o b.o -o prog       -> emcc does the link, which
+#             knows emscripten's link model; the wasm Fortran runtime is
+#             appended so flang-compiled objects resolve.
+#
+set -euo pipefail
+
+FLANG="${FLANG:-/opt/flang/host/bin/flang}"
+FORTRAN_RT="${FORTRAN_RT:-/opt/flang/wasm/lib/libFortranRuntime.a}"
+
+# A -c anywhere in the args means "compile only" — hand straight to flang.
+for a in "$@"; do
+  if [ "$a" = "-c" ]; then
+    exec "$FLANG" "$@"
+  fi
+done
+
+# Otherwise this is a link. Compile any Fortran sources to objects with flang,
+# pass everything else (objects, -l, flags) plus the wasm Fortran runtime to
+# emcc — emcc, not flang, knows how to link an emscripten module.
+emcc_args=()
+fort_objs=()
+out=""
+workdir="$(mktemp -d)"
+trap 'rm -rf "$workdir"' EXIT
+
+args=("$@")
+i=0
+while [ $i -lt ${#args[@]} ]; do
+  a="${args[$i]}"
+  case "$a" in
+    -o)            i=$((i+1)); out="${args[$i]}" ;;
+    -o*)           out="${a#-o}" ;;
+    *.f|*.F|*.f77|*.for|*.FOR|*.f90|*.F90|*.f95|*.F95)
+                   o="$workdir/$(basename "${a%.*}").o"
+                   "$FLANG" -c "$a" -o "$o"
+                   fort_objs+=("$o") ;;
+    *)             emcc_args+=("$a") ;;
+  esac
+  i=$((i+1))
+done
+
+cmd=(emcc "${emcc_args[@]}" "${fort_objs[@]}" "$FORTRAN_RT")
+[ -n "$out" ] && cmd+=(-o "$out")
+
+exec "${cmd[@]}"
